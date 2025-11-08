@@ -1,0 +1,196 @@
+// src/server.ts
+import express from "express";
+import bodyParser from "body-parser";
+import { createServer as createHttpServer } from "http";
+import { WebSocketServer } from "ws";
+import Redis from "ioredis";
+import { v4 as uuidv4 } from "uuid";
+import jwt from "jsonwebtoken";
+import type { JsonRpcRequest, JsonRpcResponse, ClientSession } from "./types";
+
+const PORT = Number(process.env.PORT || 3000);
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+
+const app = express();
+app.use(bodyParser.json());
+
+const server = createHttpServer(app);
+const wss = new WebSocketServer({ server, path: "/mcp/ws" });
+
+const redisPub = new Redis(REDIS_URL);
+const redisSub = new Redis(REDIS_URL);
+
+type Task = { id: string; title: string; done: boolean; assignee?: string; updatedAt: string };
+
+const tasks = new Map<string, Task>();
+const sessions = new Map<string, ClientSession>();
+
+function signDemoToken(sub = "demo-user") {
+  return jwt.sign({ sub, scopes: ["basic"] }, JWT_SECRET, { expiresIn: "1h" });
+}
+
+function verifyToken(token?: string) {
+  if (!token) return null;
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+app.post("/tasks", (req, res) => {
+  const { title, assignee } = req.body;
+  if (!title) return res.status(400).json({ error: "title required" });
+
+  const id = uuidv4();
+  const task: Task = { id, title, done: false, assignee, updatedAt: new Date().toISOString() };
+  tasks.set(id, task);
+  redisPub.publish("tasks", JSON.stringify({ type: "created", task }));
+  res.status(201).json(task);
+});
+
+app.put("/tasks/:id", (req, res) => {
+  const id = req.params.id;
+  const current = tasks.get(id);
+  if (!current) return res.status(404).json({ error: "not found" });
+
+  const { title, done, assignee } = req.body;
+  if (title !== undefined) current.title = title;
+  if (done !== undefined) current.done = !!done;
+  if (assignee !== undefined) current.assignee = assignee;
+  current.updatedAt = new Date().toISOString();
+
+  tasks.set(id, current);
+  redisPub.publish("tasks", JSON.stringify({ type: "updated", task: current }));
+  res.json(current);
+});
+
+app.get("/tasks", (_, res) => res.json(Array.from(tasks.values())));
+app.get("/health", (_, res) => res.json({ status: "ok" }));
+app.get("/token", (_, res) => res.json({ token: signDemoToken() }));
+
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url ?? "", http://);
+  const token = url.searchParams.get("token") ?? undefined;
+  const identity = verifyToken(token);
+
+  if (!identity) {
+    const err: JsonRpcResponse = {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: 401, message: "unauthorized" }
+    };
+    ws.send(JSON.stringify(err));
+    ws.close();
+    return;
+  }
+
+  const sessionId = uuidv4();
+  const session: ClientSession = { id: sessionId, ws, subscriptions: new Set(), identity };
+  sessions.set(sessionId, session);
+
+  ws.send(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: null,
+      result: { hello: "mcp-todo-demo", sessionId, capabilities: ["callTool", "subscribe", "unsubscribe"] }
+    })
+  );
+
+  ws.on("message", (raw) => {
+    let reqObj: JsonRpcRequest;
+    try {
+      reqObj = JSON.parse(raw.toString());
+    } catch {
+      ws.send(
+        JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } })
+      );
+      return;
+    }
+
+    handleRpc(session, reqObj).catch((err) => {
+      console.error("rpc error", err);
+      ws.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: reqObj.id,
+          error: { code: -32000, message: "Server error" }
+        })
+      );
+    });
+  });
+
+  ws.on("close", () => sessions.delete(sessionId));
+});
+
+async function handleRpc(session: ClientSession, req: JsonRpcRequest) {
+  const ws = session.ws;
+  switch (req.method) {
+    case "callTool": {
+      const { tool, args } = req.params ?? {};
+      if (tool === "suggestAssignee") {
+        const title: string = args?.title ?? "";
+        const lowered = title.toLowerCase();
+        let assignee = "unassigned";
+        if (lowered.includes("fix") || lowered.includes("bug")) assignee = "alice";
+        else if (lowered.includes("design") || lowered.includes("ux")) assignee = "bob";
+        else if (lowered.includes("deploy") || lowered.includes("ci")) assignee = "ci-bot";
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { suggested: assignee } }));
+        return;
+      }
+      if (tool === "listTasks") {
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { tasks: Array.from(tasks.values()) } }));
+        return;
+      }
+      ws.send(
+        JSON.stringify({ jsonrpc: "2.0", id: req.id, error: { code: 404, message: "tool not found" } })
+      );
+      return;
+    }
+    case "subscribe": {
+      const { channel } = req.params ?? {};
+      if (!channel) {
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, error: { code: 400, message: "channel required" } }));
+        return;
+      }
+      session.subscriptions.add(channel);
+      await redisSub.subscribe(channel);
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { subscribed: channel } }));
+      return;
+    }
+    case "unsubscribe": {
+      const { channel } = req.params ?? {};
+      session.subscriptions.delete(channel);
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { unsubscribed: channel } }));
+      return;
+    }
+    default:
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, error: { code: -32601, message: "Method not found" } }));
+  }
+}
+
+redisSub.on("message", (channel, message) => {
+  let payload;
+  try {
+    payload = JSON.parse(message);
+  } catch {
+    payload = message;
+  }
+  const notification = { jsonrpc: "2.0", method: "notification", params: { channel, payload } };
+  for (const s of sessions.values()) {
+    if (s.subscriptions.has(channel)) {
+      try {
+        s.ws.send(JSON.stringify(notification));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(Server listening http://localhost:);
+  console.log(WebSocket MCP endpoint ws://localhost:/mcp/ws);
+  console.log(GET /token to fetch a demo JWT);
+});
