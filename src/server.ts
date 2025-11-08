@@ -7,7 +7,7 @@ import { createServer as createHttpServer } from "http";
 import type { IncomingMessage } from "http";
 import { WebSocketServer } from "ws";
 import type { WebSocket, RawData } from "ws";
-import Redis from "ioredis";
+import { createClient, type RedisClientType } from "redis";
 import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
 import type { JsonRpcRequest, JsonRpcResponse, ClientSession } from "./types";
@@ -22,13 +22,101 @@ app.use(bodyParser.json());
 const server = createHttpServer(app);
 const wss = new WebSocketServer({ server, path: "/mcp/ws" });
 
-const redisPub = new Redis(REDIS_URL);
-const redisSub = new Redis(REDIS_URL);
+const redisPub: RedisClientType = createClient({ url: REDIS_URL });
+const redisSub: RedisClientType = createClient({ url: REDIS_URL });
+redisPub.on("error", (err) => console.error("redis publish error", err));
+redisSub.on("error", (err) => console.error("redis subscribe error", err));
+
+let redisEnabled = true;
+const redisReady = (async () => {
+  try {
+    await Promise.all([redisPub.connect(), redisSub.connect()]);
+    console.log("Connected to Redis");
+  } catch (err) {
+    redisEnabled = false;
+    console.error("Failed to connect to Redis:", err);
+  }
+})();
+
+const channelHandlers = new Map<string, (message: string) => void>();
+const channelCounts = new Map<string, number>();
 
 type Task = { id: string; title: string; done: boolean; assignee?: string; updatedAt: string };
 
 const tasks = new Map<string, Task>();
 const sessions = new Map<string, ClientSession>();
+
+function dispatchNotification(channel: string, message: string) {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(message);
+  } catch {
+    payload = message;
+  }
+  const notification = { jsonrpc: "2.0", method: "notification", params: { channel, payload } };
+  for (const s of sessions.values()) {
+    if (s.subscriptions.has(channel)) {
+      try {
+        s.ws.send(JSON.stringify(notification));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+async function ensureChannelSubscription(channel: string) {
+  if (!redisEnabled) return;
+  await redisReady;
+  if (!redisEnabled) return;
+  if (!channelHandlers.has(channel)) {
+    const handler = (message: string) => dispatchNotification(channel, message);
+    channelHandlers.set(channel, handler);
+    channelCounts.set(channel, 0);
+    try {
+      await redisSub.subscribe(channel, handler);
+    } catch (err) {
+      channelHandlers.delete(channel);
+      channelCounts.delete(channel);
+      throw err;
+    }
+  }
+  channelCounts.set(channel, (channelCounts.get(channel) ?? 0) + 1);
+}
+
+async function releaseChannelSubscription(channel: string) {
+  if (!redisEnabled) return;
+  await redisReady;
+  if (!redisEnabled) return;
+  const current = channelCounts.get(channel);
+  if (!current) return;
+  if (current <= 1) {
+    await redisSub.unsubscribe(channel);
+    channelHandlers.delete(channel);
+    channelCounts.delete(channel);
+  } else {
+    channelCounts.set(channel, current - 1);
+  }
+}
+
+async function publishEvent(channel: string, data: unknown) {
+  const message = JSON.stringify(data);
+  if (!redisEnabled) {
+    dispatchNotification(channel, message);
+    return;
+  }
+  await redisReady;
+  if (!redisEnabled) {
+    dispatchNotification(channel, message);
+    return;
+  }
+  try {
+    await redisPub.publish(channel, message);
+  } catch (err) {
+    console.error("redis publish error", err);
+    dispatchNotification(channel, message);
+  }
+}
 
 type JwtIdentity = (jwt.JwtPayload & { sub?: string; scopes?: string[] }) | string;
 
@@ -58,7 +146,7 @@ app.post("/tasks", (req: Request<unknown, unknown, TaskPayload>, res: Response) 
   const id = uuidv4();
   const task: Task = { id, title, done: false, assignee, updatedAt: new Date().toISOString() };
   tasks.set(id, task);
-  redisPub.publish("tasks", JSON.stringify({ type: "created", task }));
+  void publishEvent("tasks", { type: "created", task });
   res.status(201).json(task);
 });
 
@@ -74,7 +162,7 @@ app.put("/tasks/:id", (req: Request<{ id: string }, unknown, TaskPayload>, res: 
   current.updatedAt = new Date().toISOString();
 
   tasks.set(id, current);
-  redisPub.publish("tasks", JSON.stringify({ type: "updated", task: current }));
+  void publishEvent("tasks", { type: "updated", task: current });
   res.json(current);
 });
 
@@ -142,7 +230,12 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     });
   });
 
-  ws.on("close", () => sessions.delete(sessionId));
+  ws.on("close", () => {
+    sessions.delete(sessionId);
+    for (const channel of session.subscriptions) {
+      void releaseChannelSubscription(channel).catch((err) => console.error("redis unsubscribe error", err));
+    }
+  });
 });
 
 async function handleRpc(session: ClientSession, req: JsonRpcRequest) {
@@ -175,14 +268,28 @@ async function handleRpc(session: ClientSession, req: JsonRpcRequest) {
         ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, error: { code: 400, message: "channel required" } }));
         return;
       }
+      if (session.subscriptions.has(channel)) {
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { subscribed: channel } }));
+        return;
+      }
       session.subscriptions.add(channel);
-      await redisSub.subscribe(channel);
-      ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { subscribed: channel } }));
+      try {
+        await ensureChannelSubscription(channel);
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { subscribed: channel } }));
+      } catch (err) {
+        session.subscriptions.delete(channel);
+        console.error("subscribe error", err);
+        ws.send(
+          JSON.stringify({ jsonrpc: "2.0", id: req.id, error: { code: 500, message: "failed to subscribe to channel" } })
+        );
+      }
       return;
     }
     case "unsubscribe": {
       const { channel } = req.params ?? {};
-      session.subscriptions.delete(channel);
+      if (channel && session.subscriptions.delete(channel)) {
+        void releaseChannelSubscription(channel).catch((err) => console.error("unsubscribe error", err));
+      }
       ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { unsubscribed: channel } }));
       return;
     }
@@ -190,25 +297,6 @@ async function handleRpc(session: ClientSession, req: JsonRpcRequest) {
       ws.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, error: { code: -32601, message: "Method not found" } }));
   }
 }
-
-redisSub.on("message", (channel: string, message: string) => {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(message);
-  } catch {
-    payload = message;
-  }
-  const notification = { jsonrpc: "2.0", method: "notification", params: { channel, payload } };
-  for (const s of sessions.values()) {
-    if (s.subscriptions.has(channel)) {
-      try {
-        s.ws.send(JSON.stringify(notification));
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-});
 
 server.listen(PORT, () => {
   console.log(`Server listening http://localhost:${PORT}`);
