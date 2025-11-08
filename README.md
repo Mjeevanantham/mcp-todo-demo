@@ -36,3 +36,4 @@ Requirements: Node 18+, Redis, optionally `vercel` CLI and `gh` (GitHub CLI).
 2. Install deps:
 ```bash
 npm install
+# mcp-todo-demo
