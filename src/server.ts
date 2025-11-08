@@ -1,4 +1,5 @@
 // src/server.ts
+import "dotenv/config";
 import express from "express";
 import type { Request, Response } from "express";
 import bodyParser from "body-parser";
@@ -77,6 +78,15 @@ app.put("/tasks/:id", (req: Request<{ id: string }, unknown, TaskPayload>, res: 
   res.json(current);
 });
 
+app.get("/", (_: Request, res: Response) =>
+  res.send(
+    [
+      "mcp-todo-demo server is running.",
+      "REST endpoints: POST /tasks, PUT /tasks/:id, GET /tasks, GET /health, GET /token.",
+      "WebSocket endpoint: ws(s)://<host>/mcp/ws."
+    ].join("\n")
+  )
+);
 app.get("/tasks", (_: Request, res: Response) => res.json(Array.from(tasks.values())));
 app.get("/health", (_: Request, res: Response) => res.json({ status: "ok" }));
 app.get("/token", (_: Request, res: Response) => res.json({ token: signDemoToken() }));

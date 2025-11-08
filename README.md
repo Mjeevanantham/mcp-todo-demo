@@ -30,10 +30,16 @@ This repo is intentionally small so you can run and explore: add a UI, RAG, or r
 ## Quickstart (local)
 Requirements: Node 18+, Redis, optionally `vercel` CLI and `gh` (GitHub CLI).
 
-1. Install Redis
+1. Copy environment file
+   ```bash
+   cp .env.example .env
+   ```
+   Update values as needed (e.g. `REDIS_URL` for your Redis instance).
+2. Install Redis
    - macOS: `brew install redis` then `brew services start redis`
    - Docker: `docker run -p 6379:6379 redis`
-2. Install deps:
+3. Install deps:
 ```bash
 npm install
 # mcp-todo-demo
+# mcp-todo-demo git init git add . git commit -m first commit git branch -M main git remote add origin https://github.com/Mjeevanantham/mcp-todo-demo.git git push -u origin main

@@ -4,4 +4,5 @@ pnpm-debug.log
 yarn-error.log
 dist
 .vercel
+.env
 .vercel
