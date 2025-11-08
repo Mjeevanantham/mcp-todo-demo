@@ -3,6 +3,7 @@ import "dotenv/config";
 import express from "express";
 import type { Request, Response } from "express";
 import bodyParser from "body-parser";
+import cors from "cors";
 import { createServer as createHttpServer } from "http";
 import type { IncomingMessage } from "http";
 import { WebSocketServer } from "ws";
@@ -17,6 +18,27 @@ const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 
 const app = express();
+
+const allowedOrigins = [
+  "https://mcp-todo-ui.vercel.app",
+  "http://localhost:3000"
+];
+
+app.use(
+  cors({
+    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.indexOf(origin) !== -1) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "PUT", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true
+  })
+);
+
 app.use(bodyParser.json());
 
 const server = createHttpServer(app);
