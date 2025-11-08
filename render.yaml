@@ -1,0 +1,24 @@
+#
+# render.yaml - Render spec for MCP WebSocket server
+#
+services:
+  - type: web
+    name: mcp-todo-ws
+    env: node
+    region: oregon
+    plan: free
+    repo: "<GITHUB_ORG_OR_USER>/<REPO_NAME>"
+    branch: main
+    buildCommand: "npm ci && npm run build"
+    startCommand: "npm run start"
+    autoDeploy: true
+    envVars:
+      - key: REDIS_URL
+        # Set the value securely in Render Dashboard; leave blank in repo
+        value: ""
+      - key: JWT_SECRET
+        # Set the value securely in Render Dashboard; leave blank in repo
+        value: ""
+    healthCheckPath: "/health"
+    healthCheckIntervalSeconds: 10
+
