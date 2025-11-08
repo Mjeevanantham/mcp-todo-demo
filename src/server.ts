@@ -1,8 +1,11 @@
 // src/server.ts
 import express from "express";
+import type { Request, Response } from "express";
 import bodyParser from "body-parser";
 import { createServer as createHttpServer } from "http";
+import type { IncomingMessage } from "http";
 import { WebSocketServer } from "ws";
+import type { WebSocket, RawData } from "ws";
 import Redis from "ioredis";
 import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
@@ -26,11 +29,13 @@ type Task = { id: string; title: string; done: boolean; assignee?: string; updat
 const tasks = new Map<string, Task>();
 const sessions = new Map<string, ClientSession>();
 
+type JwtIdentity = (jwt.JwtPayload & { sub?: string; scopes?: string[] }) | string;
+
 function signDemoToken(sub = "demo-user") {
   return jwt.sign({ sub, scopes: ["basic"] }, JWT_SECRET, { expiresIn: "1h" });
 }
 
-function verifyToken(token?: string) {
+function verifyToken(token?: string): JwtIdentity | null {
   if (!token) return null;
   try {
     return jwt.verify(token, JWT_SECRET);
@@ -39,7 +44,13 @@ function verifyToken(token?: string) {
   }
 }
 
-app.post("/tasks", (req, res) => {
+type TaskPayload = {
+  title?: string;
+  done?: boolean;
+  assignee?: string;
+};
+
+app.post("/tasks", (req: Request<unknown, unknown, TaskPayload>, res: Response) => {
   const { title, assignee } = req.body;
   if (!title) return res.status(400).json({ error: "title required" });
 
@@ -50,7 +61,7 @@ app.post("/tasks", (req, res) => {
   res.status(201).json(task);
 });
 
-app.put("/tasks/:id", (req, res) => {
+app.put("/tasks/:id", (req: Request<{ id: string }, unknown, TaskPayload>, res: Response) => {
   const id = req.params.id;
   const current = tasks.get(id);
   if (!current) return res.status(404).json({ error: "not found" });
@@ -66,12 +77,12 @@ app.put("/tasks/:id", (req, res) => {
   res.json(current);
 });
 
-app.get("/tasks", (_, res) => res.json(Array.from(tasks.values())));
-app.get("/health", (_, res) => res.json({ status: "ok" }));
-app.get("/token", (_, res) => res.json({ token: signDemoToken() }));
+app.get("/tasks", (_: Request, res: Response) => res.json(Array.from(tasks.values())));
+app.get("/health", (_: Request, res: Response) => res.json({ status: "ok" }));
+app.get("/token", (_: Request, res: Response) => res.json({ token: signDemoToken() }));
 
-wss.on("connection", (ws, req) => {
-  const url = new URL(req.url ?? "", http://);
+wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+  const url = new URL(req.url ?? "", `http://${req.headers.host}`);
   const token = url.searchParams.get("token") ?? undefined;
   const identity = verifyToken(token);
 
@@ -98,7 +109,7 @@ wss.on("connection", (ws, req) => {
     })
   );
 
-  ws.on("message", (raw) => {
+  ws.on("message", (raw: RawData) => {
     let reqObj: JsonRpcRequest;
     try {
       reqObj = JSON.parse(raw.toString());
@@ -170,8 +181,8 @@ async function handleRpc(session: ClientSession, req: JsonRpcRequest) {
   }
 }
 
-redisSub.on("message", (channel, message) => {
-  let payload;
+redisSub.on("message", (channel: string, message: string) => {
+  let payload: unknown;
   try {
     payload = JSON.parse(message);
   } catch {
@@ -190,7 +201,7 @@ redisSub.on("message", (channel, message) => {
 });
 
 server.listen(PORT, () => {
-  console.log(Server listening http://localhost:);
-  console.log(WebSocket MCP endpoint ws://localhost:/mcp/ws);
-  console.log(GET /token to fetch a demo JWT);
+  console.log(`Server listening http://localhost:${PORT}`);
+  console.log(`WebSocket MCP endpoint ws://localhost:${PORT}/mcp/ws`);
+  console.log(`GET /token to fetch a demo JWT`);
 });
